@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Möbius ∞ City — Day</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #b8d4f0; font-family: ui-monospace, Menlo, monospace; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 14px; left: 14px;
+    color: #1a2a3a; background: rgba(255,255,255,0.7);
+    padding: 9px 13px; border-radius: 7px;
+    font-size: 12px; line-height: 1.6;
+    pointer-events: none; user-select: none;
+    backdrop-filter: blur(4px);
+  }
+  #hud b { color: #b54a00; font-weight: 600; }
+  #hud .help { font-size: 11px; opacity: 0.7; margin-top: 5px; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div><b>Möbius ∞ City</b> · 3D figure-8 · K = 3 half-twists</div>
+  <div class="help">drag — orbit · scroll — zoom · <b>R</b> — pause auto-rotate · <b>F</b> — fly-through</div>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ============================================================
+// Constants
+// ============================================================
+const K_TWIST    = 3;
+const A_AMP      = 72;     // figure-8 horizontal — stretched
+const B_AMP      = 22;
+const H_LIFT     = 11;
+const W_STRIP    = 16;
+const STRIP_THICK = 0.7;
+const HALF_T      = STRIP_THICK / 2;
+
+// ============================================================
+// Renderer / camera / scene
+// ============================================================
+const scene = new THREE.Scene();
+const skyColor = new THREE.Color(0xb8d4f0);
+scene.background = skyColor;
+scene.fog = new THREE.Fog(skyColor, 170, 500);
+
+const camera = new THREE.PerspectiveCamera(58, innerWidth / innerHeight, 0.5, 900);
+camera.position.set(120, 90, 130);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.18;
+document.body.appendChild(renderer.domElement);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ============================================================
+// Lighting (sunny daytime)
+// ============================================================
+scene.add(new THREE.AmbientLight(0xeaf0ff, 0.85));
+const sun = new THREE.DirectionalLight(0xfff4d8, 2.4);
+sun.position.set(40, 80, 30);
+scene.add(sun);
+scene.add(new THREE.HemisphereLight(0xb8d4f0, 0x6d7a55, 0.85));
+
+// ============================================================
+// Random (seeded)
+// ============================================================
+let _seed = 7717;
+function srand() { _seed = (_seed * 1664525 + 1013904223) >>> 0; return _seed / 0xFFFFFFFF; }
+function rnd(min, max) { return min + srand() * (max - min); }
+function pick(arr) { return arr[Math.floor(srand() * arr.length)]; }
+
+// ============================================================
+// City-ness — smooth field along the loop (0 = pure park, 1 = downtown)
+// Two downtown peaks (around u=0 and u=π, the figure-8 crossings),
+// fading to parks at the lobe apexes (u=π/2, 3π/2).
+// ============================================================
+function cityness(u) {
+  const centers = [0.0, Math.PI];
+  const widths  = [0.95, 0.95];
+  let total = 0;
+  for (let k = 0; k < centers.length; k++) {
+    let d = u - centers[k];
+    while (d > Math.PI)  d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    total = Math.max(total, Math.exp(-d * d / (2 * widths[k] * widths[k])));
+  }
+  return Math.min(1, total);
+}
+
+// ============================================================
+// 3D figure-8 + Möbius math
+// ============================================================
+const _yHat = new THREE.Vector3(0, 1, 0);
+
+function pathPoint(u) {
+  return new THREE.Vector3(
+    A_AMP * Math.sin(u),
+    H_LIFT * Math.cos(u),
+    B_AMP * Math.sin(u) * Math.cos(u)
+  );
+}
+function pathTangent(u, out = new THREE.Vector3()) {
+  const tx = A_AMP * Math.cos(u);
+  const ty = -H_LIFT * Math.sin(u);
+  const tz = B_AMP * Math.cos(2 * u);
+  return out.set(tx, ty, tz).normalize();
+}
+function pathFrame(u) {
+  const T  = pathTangent(u);
+  const B2 = new THREE.Vector3().crossVectors(T, _yHat).normalize();
+  const B1 = new THREE.Vector3().crossVectors(B2, T).normalize();
+  return { T, B1, B2 };
+}
+function basisAt(u) {
+  const { T, B1, B2 } = pathFrame(u);
+  const c_h = Math.cos(K_TWIST * u / 2);
+  const s_h = Math.sin(K_TWIST * u / 2);
+  const A = B1.clone().multiplyScalar(c_h).addScaledVector(B2, s_h);
+  const N = new THREE.Vector3().crossVectors(T, A).normalize();
+  const R = new THREE.Vector3().crossVectors(N, T).normalize();
+  return { T, N, R };
+}
+function pointAt(u, v) {
+  const c = pathPoint(u);
+  const { B1, B2 } = pathFrame(u);
+  const c_h = Math.cos(K_TWIST * u / 2);
+  const s_h = Math.sin(K_TWIST * u / 2);
+  return c.addScaledVector(B1, v * c_h).addScaledVector(B2, v * s_h);
+}
+// On-strip objects: TOP face (up = +N) and BOTTOM face (up = -N).
+function attachToStrip(mesh, u, v, hOver = 0) {
+  const { T, N, R } = basisAt(u);
+  const pos = pointAt(u, v);
+  const m = new THREE.Matrix4().makeBasis(R, N, T);
+  mesh.quaternion.setFromRotationMatrix(m);
+  mesh.position.copy(pos).addScaledVector(N, HALF_T + hOver);
+}
+function attachToStripBottom(mesh, u, v, hOver = 0) {
+  const { T, N, R } = basisAt(u);
+  const pos = pointAt(u, v);
+  // Right-handed basis with up=-N, forward=T  →  x = -R, y = -N, z = T
+  const negR = R.clone().negate();
+  const negN = N.clone().negate();
+  const m = new THREE.Matrix4().makeBasis(negR, negN, T);
+  mesh.quaternion.setFromRotationMatrix(m);
+  mesh.position.copy(pos).addScaledVector(N, -(HALF_T + hOver));
+}
+
+// ============================================================
+// Strip — thickened ribbon
+//   Top face = full city (road, sidewalk on +v side, grass+buildings on +v, park on -v)
+//   Bottom face = plain grass
+//   Edges = grass-tone (visible only when looking edge-on)
+// ============================================================
+function colorTop(u, v, segU, i) {
+  const av = Math.abs(v);
+  let r, g, b;
+  if (av < 0.10)        { r = 0.97; g = 0.84; b = 0.22; }                       // yellow center
+  else if (av < 1.7)    {
+    if (Math.abs(av - 0.85) < 0.06) {
+      const dash = (Math.floor(i * 100 / segU) % 2) === 0;
+      if (dash) { r = 0.95; g = 0.95; b = 0.95; } else { r = 0.36; g = 0.36; b = 0.38; }
+    } else { r = 0.36; g = 0.36; b = 0.38; }
+  }
+  else if (av < 1.9)    { r = 0.95; g = 0.95; b = 0.95; }
+  else if (av < 2.05)   { r = 0.55; g = 0.55; b = 0.56; }
+  else if (av < 3.6)    {
+    // sidewalk — same on both sides; concrete (city) → dirt path (countryside)
+    const cn = cityness(u);
+    r = 0.78 * cn + 0.62 * (1 - cn);
+    g = 0.78 * cn + 0.60 * (1 - cn);
+    b = 0.76 * cn + 0.48 * (1 - cn);
+  }
+  else if (av < 3.75)   { r = 0.40; g = 0.42; b = 0.34; }
+  else {
+    // ground beyond sidewalk — same on both sides: pavement (city) → grass (park)
+    const t = Math.min(1, (av - 3.75) / (W_STRIP / 2 - 3.75));
+    const cn = cityness(u);
+    const cityR = 0.50, cityG = 0.50, cityB = 0.45;
+    const parkR = 0.32, parkG = 0.55, parkB = 0.22;
+    r = (cityR * cn + parkR * (1 - cn)) - t * 0.05 + Math.sin(u * 11 + v) * 0.015;
+    g = (cityG * cn + parkG * (1 - cn)) - t * 0.05 + Math.cos(u * 9 + v) * 0.015;
+    b = (cityB * cn + parkB * (1 - cn)) - t * 0.04;
+  }
+  const seamDist = Math.min(i, segU - i);
+  if (seamDist < 1.5) { r = Math.min(1, r + 0.30); g = Math.min(1, g + 0.20); b = Math.min(1, b - 0.05); }
+  return [r, g, b];
+}
+// The Möbius identification glues p_top(u, v) → p_bot(u, -v) at the seam,
+// so the bottom face's color at (u, v) should match the top's color at (u, -v).
+// This keeps the road continuous as it wraps from one face to the other.
+function colorBottom(u, v, segU, i) {
+  const c = colorTop(u, -v, segU, i);
+  return [c[0] * 0.94, c[1] * 0.94, c[2] * 0.94];   // very subtle dim so faces are distinguishable
+}
+
+function buildThickMobius(segU, segV) {
+  const positions = [];
+  const colors = [];
+  const indices = [];
+
+  const centerData = [];
+  for (let i = 0; i < segU; i++) {
+    const u = (i / segU) * Math.PI * 2;
+    centerData.push({ u, N: basisAt(u).N });
+  }
+
+  // Top vertices
+  for (let i = 0; i < segU; i++) {
+    const { u, N } = centerData[i];
+    for (let j = 0; j <= segV; j++) {
+      const v = (j / segV - 0.5) * W_STRIP;
+      const p = pointAt(u, v);
+      positions.push(p.x + N.x * HALF_T, p.y + N.y * HALF_T, p.z + N.z * HALF_T);
+      const c = colorTop(u, v, segU, i);
+      colors.push(c[0], c[1], c[2]);
+    }
+  }
+  const totalPerSurf = segU * (segV + 1);
+  const TOP = 0;
+  const BOT = totalPerSurf;
+
+  // Bottom vertices
+  for (let i = 0; i < segU; i++) {
+    const { u, N } = centerData[i];
+    for (let j = 0; j <= segV; j++) {
+      const v = (j / segV - 0.5) * W_STRIP;
+      const p = pointAt(u, v);
+      positions.push(p.x - N.x * HALF_T, p.y - N.y * HALF_T, p.z - N.z * HALF_T);
+      const c = colorBottom(u, v, segU, i);
+      colors.push(c[0], c[1], c[2]);
+    }
+  }
+
+  const vid = (surf, i, j) => surf + i * (segV + 1) + j;
+
+  // Top quads (Möbius wrap to BOT at i=segU-1, j flipped)
+  for (let i = 0; i < segU; i++) {
+    const i_next = (i + 1) % segU;
+    const wrap = i === segU - 1;
+    const surfNext = wrap ? BOT : TOP;
+    for (let j = 0; j < segV; j++) {
+      const a = vid(TOP, i, j);
+      const d = vid(TOP, i, j + 1);
+      const jb = wrap ? (segV - j)     : j;
+      const jc = wrap ? (segV - j - 1) : (j + 1);
+      const b = vid(surfNext, i_next, jb);
+      const c = vid(surfNext, i_next, jc);
+      indices.push(a, b, d, b, c, d);
+    }
+  }
+  // Bottom quads (reversed winding so they face -N) — wraps to TOP
+  for (let i = 0; i < segU; i++) {
+    const i_next = (i + 1) % segU;
+    const wrap = i === segU - 1;
+    const surfNext = wrap ? TOP : BOT;
+    for (let j = 0; j < segV; j++) {
+      const a = vid(BOT, i, j);
+      const d = vid(BOT, i, j + 1);
+      const jb = wrap ? (segV - j)     : j;
+      const jc = wrap ? (segV - j - 1) : (j + 1);
+      const b = vid(surfNext, i_next, jb);
+      const c = vid(surfNext, i_next, jc);
+      indices.push(a, d, b, b, d, c);
+    }
+  }
+  // Edges at j=0 and j=segV, also wrap with surface-swap
+  for (let i = 0; i < segU; i++) {
+    const i_next = (i + 1) % segU;
+    const wrap = i === segU - 1;
+    // Right edge (j = segV) → after wrap maps to (j=0) on the OTHER surface
+    {
+      const a_top = vid(TOP, i, segV);
+      const a_bot = vid(BOT, i, segV);
+      const next_j = wrap ? 0 : segV;
+      const next_top = wrap ? BOT : TOP;
+      const next_bot = wrap ? TOP : BOT;
+      const b_top = vid(next_top, i_next, next_j);
+      const b_bot = vid(next_bot, i_next, next_j);
+      indices.push(a_top, a_bot, b_top, a_bot, b_bot, b_top);
+    }
+    // Left edge (j = 0) → after wrap maps to (j=segV) on the OTHER surface
+    {
+      const a_top = vid(TOP, i, 0);
+      const a_bot = vid(BOT, i, 0);
+      const next_j = wrap ? segV : 0;
+      const next_top = wrap ? BOT : TOP;
+      const next_bot = wrap ? TOP : BOT;
+      const b_top = vid(next_top, i_next, next_j);
+      const b_bot = vid(next_bot, i_next, next_j);
+      indices.push(a_top, b_top, a_bot, b_top, b_bot, a_bot);
+    }
+  }
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geom.setAttribute('color',    new THREE.Float32BufferAttribute(colors, 3));
+  geom.setIndex(indices);
+  geom.computeVertexNormals();
+  return geom;
+}
+
+const stripGeom = buildThickMobius(680, 80);
+const stripMesh = new THREE.Mesh(
+  stripGeom,
+  new THREE.MeshStandardMaterial({
+    vertexColors: true, side: THREE.DoubleSide,
+    roughness: 0.95, metalness: 0,
+  })
+);
+scene.add(stripMesh);
+
+// ============================================================
+// Facade textures
+// ============================================================
+function makeFacadeTex(faceW, faceH, type) {
+  const ppm = 14;
+  const w = Math.max(48, Math.min(256, Math.floor(faceW * ppm)));
+  const h = Math.max(64, Math.min(384, Math.floor(faceH * ppm)));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d');
+
+  const wallColors = {
+    office:    ['#c4ccd6', '#b8c0cc', '#aab2c0', '#cdd4dc', '#a6b0bc', '#dde0e8'],
+    apartment: ['#d8b896', '#c89e78', '#e0c4a0', '#bd9a78', '#cea888', '#b88a68'],
+    shop:      ['#dcd8d0', '#c8c0b6', '#bcb4a8', '#d4ccc0', '#e8e0d4'],
+  }[type];
+  ctx.fillStyle = pick(wallColors);
+  ctx.fillRect(0, 0, w, h);
+
+  const grid = {
+    office:    { gw: 1.4, gh: 2.4 },
+    apartment: { gw: 2.0, gh: 2.6 },
+    shop:      { gw: 1.6, gh: 2.0 },
+  }[type];
+  const cols = Math.max(1, Math.floor(faceW / grid.gw));
+  const rows = Math.max(1, Math.floor((faceH - 0.8) / grid.gh));
+  const wPx  = grid.gw * 0.55 * ppm;
+  const hPx  = grid.gh * 0.55 * ppm;
+
+  const glassColors = ['#5a78a0', '#6b86ad', '#4a6890', '#7596b8', '#587898', '#3c5878', '#86a4c0'];
+  for (let r = 0; r < rows; r++) {
+    for (let col = 0; col < cols; col++) {
+      ctx.fillStyle = pick(glassColors);
+      const cx = (col + 0.5) * (faceW / cols) * ppm;
+      const cy = h - ((r + 0.5) * grid.gh + 0.8) * ppm;
+      ctx.fillRect(cx - wPx / 2, cy - hPx / 2, wPx, hPx);
+      if (srand() < 0.3) {
+        ctx.fillStyle = '#cce0f4';
+        ctx.fillRect(cx - wPx / 2 + 1, cy - hPx / 2 + 1, wPx * 0.25, 2);
+      }
+    }
+  }
+
+  const gfH = 0.8 * ppm;
+  ctx.fillStyle = '#3a3a3e';
+  ctx.fillRect(0, h - gfH, w, gfH);
+  if (type === 'shop' || srand() < 0.5) {
+    const shopCols = Math.max(1, Math.floor(faceW / 2.2));
+    const swPx = (faceW / shopCols) * 0.75 * ppm;
+    const shPx = gfH * 0.7;
+    for (let col = 0; col < shopCols; col++) {
+      const cx = (col + 0.5) * (faceW / shopCols) * ppm;
+      ctx.fillStyle = pick(['#5a78a0', '#a04848', '#3c6a48', '#6a4a90', '#8a8038', '#aa6630']);
+      ctx.fillRect(cx - swPx / 2, h - gfH / 2 - shPx / 2, swPx, shPx);
+    }
+  }
+
+  if (srand() < 0.32) {
+    const signColor = pick(['#d83040', '#3a8a48', '#3070b8', '#dca838', '#a040a0', '#d05a20']);
+    ctx.fillStyle = signColor;
+    const sx = w * (0.1 + srand() * 0.3);
+    const sw = w * (0.3 + srand() * 0.4);
+    const sh = 0.55 * ppm;
+    ctx.fillRect(sx, 4, sw, sh);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(sx + sw * 0.15, 4 + sh * 0.35, sw * 0.7, sh * 0.18);
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+
+const facadeMatPool = { office: [], apartment: [], shop: [] };
+const NUM = { office: 14, apartment: 14, shop: 8 };
+for (const type of Object.keys(NUM)) {
+  for (let i = 0; i < NUM[type]; i++) {
+    const baseSize = type === 'office' ? [10, 22] : type === 'apartment' ? [8, 12] : [7, 5];
+    const tex = makeFacadeTex(baseSize[0], baseSize[1], type);
+    facadeMatPool[type].push(new THREE.MeshStandardMaterial({
+      map: tex,
+      roughness: 0.7, metalness: 0.05,
+    }));
+  }
+}
+const wallMats = {
+  office:    new THREE.MeshStandardMaterial({ color: 0xb4bcc8, roughness: 0.8 }),
+  apartment: new THREE.MeshStandardMaterial({ color: 0xc8a888, roughness: 0.85 }),
+  shop:      new THREE.MeshStandardMaterial({ color: 0xc8c2b8, roughness: 0.85 }),
+};
+const roofMat   = new THREE.MeshStandardMaterial({ color: 0x6c6e76, roughness: 0.9 });
+const spikeMat  = new THREE.MeshStandardMaterial({ color: 0x383838, roughness: 0.6, metalness: 0.4 });
+const balconyMat= new THREE.MeshStandardMaterial({ color: 0x4a4a4e, roughness: 0.85 });
+const awningMats= [
+  new THREE.MeshStandardMaterial({ color: 0xc04040, roughness: 0.6 }),
+  new THREE.MeshStandardMaterial({ color: 0x408a48, roughness: 0.6 }),
+  new THREE.MeshStandardMaterial({ color: 0x3060a8, roughness: 0.6 }),
+  new THREE.MeshStandardMaterial({ color: 0xc88030, roughness: 0.6 }),
+];
+
+// ============================================================
+// Buildings — only +v side; facade always on local -X face
+// ============================================================
+function makeBuilding(facadeIdx, w, h, d, type) {
+  const wallMat   = wallMats[type];
+  const facadeMat = pick(facadeMatPool[type]);
+  // facadeIdx: 0 = facade on +X face, 1 = facade on -X face
+  const mats = [wallMat, wallMat, wallMat, wallMat, wallMat, wallMat];
+  mats[facadeIdx] = facadeMat;
+
+  const g = new THREE.Group();
+  const main = new THREE.Mesh(new THREE.BoxGeometry(d, h, w), mats);
+  main.position.y = h / 2;
+  g.add(main);
+
+  const facadeSign = facadeIdx === 0 ? +1 : -1;   // +X (idx 0) or -X (idx 1)
+
+  // Apartment balconies on the road-facing side
+  if (type === 'apartment' && srand() < 0.65) {
+    const floors = Math.max(1, Math.floor(h / 2.6) - 1);
+    for (let bi = 1; bi <= floors; bi++) {
+      const b = new THREE.Mesh(
+        new THREE.BoxGeometry(0.18, 0.08, w * 0.7),
+        balconyMat
+      );
+      b.position.set(facadeSign * (d / 2 + 0.09), bi * 2.6 + 0.4, 0);
+      g.add(b);
+      const rail = new THREE.Mesh(
+        new THREE.BoxGeometry(0.05, 0.45, w * 0.7),
+        balconyMat
+      );
+      rail.position.set(facadeSign * (d / 2 + 0.18), bi * 2.6 + 0.62, 0);
+      g.add(rail);
+    }
+  }
+
+  // Shop awning
+  if (type === 'shop' && srand() < 0.55) {
+    const aw = new THREE.Mesh(
+      new THREE.BoxGeometry(0.45, 0.15, w * 0.95),
+      pick(awningMats)
+    );
+    aw.position.set(facadeSign * (d / 2 + 0.22), 1.15, 0);
+    aw.rotation.z = -0.18 * facadeSign;
+    g.add(aw);
+  }
+
+  if (srand() < 0.32) {
+    const rh = 0.6 + srand() * 1.4;
+    const roof = new THREE.Mesh(new THREE.BoxGeometry(d * 0.6, rh, w * 0.6), roofMat);
+    roof.position.y = h + rh / 2;
+    g.add(roof);
+  }
+  if (srand() < 0.13) {
+    const sh = 1.4 + srand() * 1.4;
+    const spike = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, sh, 4), spikeMat);
+    spike.position.y = h + sh / 2;
+    g.add(spike);
+  }
+  return g;
+}
+
+// Buildings on BOTH sides of the road, on BOTH faces. Lower overall density.
+//   Each building's facade is oriented to face the road regardless of side/face.
+function placeBuildings(slots, face, densityScale) {
+  for (let i = 0; i < slots; i++) {
+    const u  = (i / slots) * Math.PI * 2 + (srand() - 0.5) * 0.04;
+    const cn = cityness(u);
+    if (srand() > cn * 0.65 * densityScale + 0.04) continue;
+
+    const type = pick(['office', 'apartment', 'apartment', 'shop', 'office']);
+    const isLandmark = cn > 0.7 && srand() < 0.06;
+    const w = 1.0 + srand() * 1.6;
+    const d = 1.0 + srand() * 1.4;
+    const heightScale = 0.50 + cn * 0.65;
+    let h;
+    if      (isLandmark)            h = (5 + srand() * 8) * heightScale;
+    else if (type === 'office')     h = (2 + srand() * 4) * heightScale;
+    else if (type === 'apartment')  h = (1.5 + srand() * 2.5) * heightScale;
+    else                            h = (1.0 + srand() * 1.4) * heightScale;
+
+    const sideSign = srand() < 0.5 ? 1 : -1;
+    const v_off = sideSign * (3.85 + srand() * 2.6);
+    // Pick the box face that ends up pointing toward the road (v=0 centerline)
+    //   top face,    side +v: road is at -R (-X local)  → facade idx 1
+    //   top face,    side -v: road is at +R (+X local)  → facade idx 0
+    //   bottom face, side +v: road is at -R,  but local +X = -R world → facade idx 0
+    //   bottom face, side -v: road is at +R,  but local -X = +R world → facade idx 1
+    const facadeIdx = ((face === 'top') === (sideSign > 0)) ? 1 : 0;
+    const b = makeBuilding(facadeIdx, w, h, d, type);
+    if (face === 'top') attachToStrip(b, u, v_off, 0);
+    else                attachToStripBottom(b, u, v_off, 0);
+    scene.add(b);
+  }
+}
+placeBuildings(380, 'top',    1.0);
+placeBuildings(330, 'bottom', 0.9);
+
+// ============================================================
+// Streetlamps (instanced) — both sides of the road
+// ============================================================
+const N_LAMPS_PER_FACE = 60;
+const N_LAMPS = N_LAMPS_PER_FACE * 2;
+const lampPostInst = new THREE.InstancedMesh(
+  new THREE.CylinderGeometry(0.04, 0.05, 1.5, 6),
+  new THREE.MeshStandardMaterial({ color: 0x2a2a2c, roughness: 0.9 }),
+  N_LAMPS
+);
+const lampBulbInst = new THREE.InstancedMesh(
+  new THREE.SphereGeometry(0.13, 14, 10),
+  new THREE.MeshStandardMaterial({ color: 0xeae6d4, roughness: 0.4, metalness: 0.1 }),
+  N_LAMPS
+);
+const tmp = new THREE.Object3D();
+let lampIdx = 0;
+function addLamp(u, v_off, face) {
+  const { T, N, R } = basisAt(u);
+  const negR = R.clone().negate();
+  const negN = N.clone().negate();
+  const basisM = face === 'top'
+    ? new THREE.Matrix4().makeBasis(R, N, T)
+    : new THREE.Matrix4().makeBasis(negR, negN, T);
+  const pos = pointAt(u, v_off);
+  const sgn = face === 'top' ? 1 : -1;
+
+  tmp.position.copy(pos).addScaledVector(N, sgn * (HALF_T + 0.75));
+  tmp.quaternion.setFromRotationMatrix(basisM);
+  tmp.scale.set(1, 1, 1);
+  tmp.updateMatrix();
+  lampPostInst.setMatrixAt(lampIdx, tmp.matrix);
+
+  tmp.position.copy(pos).addScaledVector(N, sgn * (HALF_T + 1.55));
+  tmp.updateMatrix();
+  lampBulbInst.setMatrixAt(lampIdx, tmp.matrix);
+  lampIdx++;
+}
+for (let i = 0; i < N_LAMPS_PER_FACE; i++) {
+  const u = (i / N_LAMPS_PER_FACE) * Math.PI * 2;
+  const side = i % 2 === 0 ? 1 : -1;
+  addLamp(u, side * 2.7, 'top');
+  addLamp(u, side * 2.7, 'bottom');
+}
+lampPostInst.instanceMatrix.needsUpdate = true;
+lampBulbInst.instanceMatrix.needsUpdate = true;
+scene.add(lampPostInst, lampBulbInst);
+
+// ============================================================
+// Trees — four kinds
+// ============================================================
+const trunkMat = new THREE.MeshStandardMaterial({ color: 0x6a4a30, roughness: 0.95 });
+const trunkMatDark = new THREE.MeshStandardMaterial({ color: 0x4a3220, roughness: 0.95 });
+const greens = [0x4a8044, 0x568a4a, 0x6a9a52, 0x4a7a3a, 0x559644, 0x488050];
+const greensDark = [0x2a5a32, 0x356438, 0x205028, 0x2c5a2a];
+
+function makeBroadleaf() {
+  const g = new THREE.Group();
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.14, 0.85, 6), trunkMat);
+  trunk.position.y = 0.42; g.add(trunk);
+  const leaves = new THREE.Mesh(
+    new THREE.SphereGeometry(0.55 + srand() * 0.25, 10, 8),
+    new THREE.MeshStandardMaterial({ color: pick(greens), roughness: 0.9, flatShading: true })
+  );
+  leaves.position.y = 1.10 + srand() * 0.2; g.add(leaves);
+  return g;
+}
+function makeConifer() {
+  const g = new THREE.Group();
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.12, 0.45, 6), trunkMatDark);
+  trunk.position.y = 0.22; g.add(trunk);
+  const layers = 2 + Math.floor(srand() * 2);
+  const baseR = 0.40 + srand() * 0.15;
+  for (let k = 0; k < layers; k++) {
+    const t = k / layers;
+    const cone = new THREE.Mesh(
+      new THREE.ConeGeometry(baseR * (1 - t * 0.5), 0.7, 8),
+      new THREE.MeshStandardMaterial({ color: pick(greensDark), roughness: 0.9, flatShading: true })
+    );
+    cone.position.y = 0.55 + k * 0.45;
+    g.add(cone);
+  }
+  return g;
+}
+function makeColumnar() {
+  const g = new THREE.Group();
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.10, 0.4, 6), trunkMatDark);
+  trunk.position.y = 0.2; g.add(trunk);
+  const leaves = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.16, 0.30, 1.6 + srand() * 0.4, 7),
+    new THREE.MeshStandardMaterial({ color: pick(greensDark), roughness: 0.85, flatShading: true })
+  );
+  leaves.position.y = 1.2; g.add(leaves);
+  // taper top with a small cone
+  const cap = new THREE.Mesh(
+    new THREE.ConeGeometry(0.16, 0.3, 7),
+    leaves.material
+  );
+  cap.position.y = 2.05; g.add(cap);
+  return g;
+}
+function makeBushy() {
+  const g = new THREE.Group();
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.08, 0.25, 6), trunkMat);
+  trunk.position.y = 0.12; g.add(trunk);
+  const c = pick(greens);
+  const m = new THREE.MeshStandardMaterial({ color: c, roughness: 0.9, flatShading: true });
+  const blobs = [
+    [0, 0.45, 0, 0.30],
+    [0.20, 0.55, 0.10, 0.24],
+    [-0.18, 0.50, -0.08, 0.26],
+    [0.05, 0.70, 0.0, 0.22],
+  ];
+  for (const [x, y, z, r] of blobs) {
+    const s = new THREE.Mesh(new THREE.SphereGeometry(r, 8, 6), m);
+    s.position.set(x, y, z); g.add(s);
+  }
+  return g;
+}
+function makeTree(kind) {
+  return ({ broadleaf: makeBroadleaf, conifer: makeConifer, columnar: makeColumnar, bushy: makeBushy }[kind])();
+}
+
+// Trees scattered on both sides of road, both faces. More in low-cityness areas.
+function placeTrees(slots, face) {
+  const attach = face === 'top' ? attachToStrip : attachToStripBottom;
+  for (let i = 0; i < slots; i++) {
+    const u = srand() * Math.PI * 2;
+    const cn = cityness(u);
+    if (srand() > (1 - cn) * 0.60 + 0.18) continue;
+
+    const sideSign = srand() < 0.5 ? 1 : -1;
+    const v_off = sideSign * (cn > 0.55
+      ? 3.0 + srand() * 0.7              // narrow row by curb in city
+      : 2.5 + srand() * 4.5);            // spread across countryside
+
+    const kind = cn > 0.55
+      ? pick(['broadleaf', 'columnar', 'broadleaf'])
+      : pick(['broadleaf', 'broadleaf', 'conifer', 'columnar', 'bushy', 'bushy']);
+    const t = makeTree(kind);
+    t.scale.setScalar(0.7 + srand() * 0.5);
+    t.rotation.y = srand() * Math.PI * 2;
+    attach(t, u, v_off, 0);
+    scene.add(t);
+  }
+}
+placeTrees(250, 'top');
+placeTrees(220, 'bottom');
+
+// ============================================================
+// Street furniture
+// ============================================================
+function makeBench() {
+  const g = new THREE.Group();
+  const wood = new THREE.MeshStandardMaterial({ color: 0x7a5638, roughness: 0.9 });
+  const metal = new THREE.MeshStandardMaterial({ color: 0x282828, roughness: 0.6, metalness: 0.4 });
+  const seat = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.07, 0.42), wood);
+  seat.position.y = 0.38; g.add(seat);
+  const back = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.42, 0.06), wood);
+  back.position.set(0, 0.6, -0.18); g.add(back);
+  for (const x of [-0.6, 0.6]) {
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.4, 0.42), metal);
+    leg.position.set(x, 0.19, 0); g.add(leg);
+  }
+  return g;
+}
+function makeFireHydrant() {
+  const g = new THREE.Group();
+  const red = new THREE.MeshStandardMaterial({ color: 0xc83820, roughness: 0.6 });
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.18, 0.55, 8), red);
+  body.position.y = 0.275; g.add(body);
+  const top = new THREE.Mesh(new THREE.SphereGeometry(0.16, 8, 6), red);
+  top.position.y = 0.55; g.add(top);
+  for (const sx of [-1, 1]) {
+    const spout = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.18, 6), red);
+    spout.rotation.z = Math.PI / 2;
+    spout.position.set(sx * 0.20, 0.36, 0); g.add(spout);
+  }
+  return g;
+}
+function makeMailbox() {
+  const g = new THREE.Group();
+  const post = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.05, 0.05, 0.9, 6),
+    new THREE.MeshStandardMaterial({ color: 0x282828 })
+  );
+  post.position.y = 0.45; g.add(post);
+  const box = new THREE.Mesh(
+    new THREE.BoxGeometry(0.50, 0.55, 0.34),
+    new THREE.MeshStandardMaterial({ color: 0x3258b4, roughness: 0.6 })
+  );
+  box.position.y = 1.05; g.add(box);
+  return g;
+}
+function makeTrashCan() {
+  const g = new THREE.Group();
+  const m = new THREE.MeshStandardMaterial({ color: 0x4a4a4e, roughness: 0.85 });
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.20, 0.55, 10), m);
+  body.position.y = 0.275; g.add(body);
+  const lid = new THREE.Mesh(new THREE.CylinderGeometry(0.20, 0.20, 0.05, 10), m);
+  lid.position.y = 0.575; g.add(lid);
+  return g;
+}
+function makeKiosk() {
+  const g = new THREE.Group();
+  const m = new THREE.MeshStandardMaterial({ color: pick([0x4868a8, 0x6a4f3a, 0x586a4a]), roughness: 0.7 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.4, 0.7), m);
+  body.position.y = 0.7; g.add(body);
+  const roof = new THREE.Mesh(
+    new THREE.BoxGeometry(1.1, 0.1, 0.85),
+    new THREE.MeshStandardMaterial({ color: 0x303030 })
+  );
+  roof.position.y = 1.45; g.add(roof);
+  return g;
+}
+
+// Sidewalk furniture — both sides of road, both faces, lighter density overall.
+function placeSidewalkFurniture(face, densityScale) {
+  const attach = face === 'top' ? attachToStrip : attachToStripBottom;
+  // hydrants — concentrate in city
+  for (let i = 0; i < 22; i++) {
+    const u = srand() * Math.PI * 2;
+    if (srand() > cityness(u) * 0.7 * densityScale + 0.06) continue;
+    const sideSign = srand() < 0.5 ? 1 : -1;
+    const obj = makeFireHydrant();
+    attach(obj, u, sideSign * (2.2 + srand() * 0.4), 0);
+    scene.add(obj);
+  }
+  // mailboxes
+  for (let i = 0; i < 14; i++) {
+    const u = srand() * Math.PI * 2;
+    if (srand() > cityness(u) * 0.65 * densityScale + 0.08) continue;
+    const sideSign = srand() < 0.5 ? 1 : -1;
+    const m = makeMailbox();
+    m.rotation.y = srand() * Math.PI * 2;
+    attach(m, u, sideSign * (2.4 + srand() * 0.4), 0);
+    scene.add(m);
+  }
+  // trashcans
+  for (let i = 0; i < 22; i++) {
+    const u = srand() * Math.PI * 2;
+    if (srand() > 0.55 * densityScale) continue;
+    const sideSign = srand() < 0.5 ? 1 : -1;
+    const tc = makeTrashCan();
+    attach(tc, u, sideSign * (2.5 + srand() * 0.3), 0);
+    scene.add(tc);
+  }
+  // kiosks — city only
+  for (let i = 0; i < 8; i++) {
+    const u = srand() * Math.PI * 2;
+    if (srand() > cityness(u) * 0.85 * densityScale) continue;
+    const sideSign = srand() < 0.5 ? 1 : -1;
+    const k = makeKiosk();
+    k.rotation.y = (srand() < 0.5 ? 0 : Math.PI);
+    attach(k, u, sideSign * (2.6 + srand() * 0.4), 0);
+    scene.add(k);
+  }
+  // benches — mostly in low-cityness (park-like) areas
+  for (let i = 0; i < 22; i++) {
+    const u = srand() * Math.PI * 2;
+    if (srand() > (1 - cityness(u)) * 0.65 + 0.15) continue;
+    const sideSign = srand() < 0.5 ? 1 : -1;
+    const bench = makeBench();
+    bench.rotation.y = srand() < 0.5 ? 0 : Math.PI;
+    attach(bench, u, sideSign * (2.0 + srand() * 0.5), 0);
+    scene.add(bench);
+  }
+}
+placeSidewalkFurniture('top',    1.0);
+placeSidewalkFurniture('bottom', 0.85);
+
+// ============================================================
+// Cars
+// ============================================================
+function makeCar() {
+  const g = new THREE.Group();
+  const color = pick([0xc84040, 0x4070b0, 0x508a52, 0xe8e8e8, 0x282828, 0xd6b048, 0x986080, 0x60a0a0, 0xf0a040]);
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(0.78, 0.32, 1.7),
+    new THREE.MeshStandardMaterial({ color, roughness: 0.45, metalness: 0.5 })
+  );
+  body.position.y = 0.24; g.add(body);
+  const cabin = new THREE.Mesh(
+    new THREE.BoxGeometry(0.70, 0.28, 0.9),
+    new THREE.MeshStandardMaterial({ color: 0x2a3848, roughness: 0.4, metalness: 0.4 })
+  );
+  cabin.position.set(0, 0.52, -0.04); g.add(cabin);
+  for (const sx of [-0.25, 0.25]) {
+    const head = new THREE.Mesh(
+      new THREE.SphereGeometry(0.06, 8, 6),
+      new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.2, metalness: 0.2 })
+    );
+    head.position.set(sx, 0.27, 0.82); g.add(head);
+  }
+  for (const sx of [-0.30, 0.30]) {
+    const tail = new THREE.Mesh(
+      new THREE.SphereGeometry(0.05, 8, 6),
+      new THREE.MeshStandardMaterial({ color: 0x882222, roughness: 0.4 })
+    );
+    tail.position.set(sx, 0.27, -0.82); g.add(tail);
+  }
+  return g;
+}
+// Cars on both faces — only in / near city, lighter density
+for (const face of ['top', 'bottom']) {
+  const attach = face === 'top' ? attachToStrip : attachToStripBottom;
+  const slots = face === 'top' ? 50 : 40;
+  for (let i = 0; i < slots; i++) {
+    const u = srand() * Math.PI * 2;
+    if (srand() > cityness(u) * 0.6 + 0.06) continue;
+    const side = srand() < 0.5 ? 1 : -1;
+    const v_off = side * (1.78 + srand() * 0.18);
+    const car = makeCar();
+    if (srand() < 0.5) car.rotation.y = Math.PI;
+    attach(car, u, v_off, 0);
+    scene.add(car);
+  }
+}
+
+// ============================================================
+// OrbitControls + auto-rotate + fly-through
+// ============================================================
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.enableDamping = true;
+orbit.dampingFactor = 0.06;
+orbit.target.set(0, 0, 0);
+orbit.minDistance = 30;
+orbit.maxDistance = 480;
+orbit.autoRotate = true;
+orbit.autoRotateSpeed = 0.32;
+
+let flyMode = false;
+let flyT = 0;
+
+addEventListener('keydown', e => {
+  if (e.code === 'KeyR') orbit.autoRotate = !orbit.autoRotate;
+  else if (e.code === 'KeyF') {
+    flyMode = !flyMode;
+    orbit.enabled = !flyMode;
+    if (flyMode) orbit.autoRotate = false;
+  }
+});
+
+const clock = new THREE.Clock();
+function frame() {
+  requestAnimationFrame(frame);
+  const dt = clock.getDelta();
+
+  if (flyMode) {
+    flyT += dt * 0.018;
+    const u = flyT * Math.PI * 2;
+    const pos = pointAt(u, 0);
+    const { T, N } = basisAt(u);
+    pos.addScaledVector(N, HALF_T + 2.4);
+    camera.position.copy(pos);
+    const ahead = pointAt(u + 0.04, 0).addScaledVector(N, HALF_T + 1.6);
+    camera.up.copy(N);
+    camera.lookAt(ahead);
+  } else {
+    orbit.update();
+  }
+
+  renderer.render(scene, camera);
+}
+frame();
+</script>
+</body>
+</html>
